@@ -65,14 +65,28 @@ node mast.js
 **Serve a folder:**
 
 ```bash
-node server.js ./my_folder
+node server.js <path_to_folder> [trusted_key_path] [max_streams] [bind_port]
 ```
+
+| Argument | Description | Default / Example |
+| :--- | :--- | :--- |
+| `<path_to_folder>` | The local directory to share. | `./` (Current dir) |
+| `[trusted_key_path]` | Path to a `.pub` file for ID verification. | `none` (Accept any) |
+| `[max_streams]` | Max parallel workers. | `8` |
+| `[bind_port]` | Port for the bootstrap server. | `3000` |
 
 **Receive files:**
 
 ```bash
-node client.js 3000 none 8 127.0.0.1
+node client.js <port> [trusted_key_path] [streams] [address]
 ```
+
+| Argument | Description | Default / Example |
+| :--- | :--- | :--- |
+| `<port>` | The server's bootstrap port. | `3000` |
+| `[trusted_key_path]` | Path to a `.pub` file for ID verification. | `none` |
+| `[streams]` | Number of parallel data streams to open. | `8` |
+| `[address]` | The IP or hostname of the server. | `127.0.0.1` |
 
 ---
 
