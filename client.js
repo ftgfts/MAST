@@ -22,6 +22,28 @@ function formatBytes(bytes) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+function computeFileHash(filePath) {
+    try {
+        const data = fs.readFileSync(filePath);
+        return crypto.createHash('sha256').update(data).digest('hex');
+    } catch (e) {
+        return null;
+    }
+}
+
+// Verify the server's Ed25519 signature over the manifest file hashes.
+// The payload mirrors signManifest() on the server side exactly.
+function verifyManifest(manifest, serverPubHex) {
+    try {
+        if (!manifest.manifest_sig || !serverPubHex) return false;
+        const payload = manifest.master_hash + manifest.files.map(f => f.path + ':' + (f.sha256 || '')).join('|');
+        return verify(payload, Buffer.from(manifest.manifest_sig, 'hex'), serverPubHex);
+    } catch (e) {
+        return false;
+    }
+}
+
+
 if (process.argv.includes('--help') || process.argv.includes('-h')) {
     console.log(`
 MAST Client - Securely receive files and folders
@@ -140,14 +162,22 @@ async function bootstrap() {
                     const decrypted = decrypt(packetData, sharedSecret);
                     const manifest = JSON.parse(decrypted.toString());
                     if (manifest.type === 'init' && !bootstrapResolved) {
+                        if (!verifyManifest(manifest, currentServerId)) {
+                            stopThrobber();
+                            reject(new Error('Manifest signature verification failed — possible tampering'));
+                            return;
+                        }
                         globalManifest = manifest;
                         bootstrapResolved = true;
                         stopThrobber();
                         resolve(manifest);
                     } else if (manifest.type === 'merkle') {
-                        const merkleFile = path.join(require('os').tmpdir(), `mast_client_merkle_${Date.now()}.json`);
-                        fs.writeFileSync(merkleFile, JSON.stringify(manifest.merkle_tree));
+                        // merkle tree received and verified by server; file hashes come from manifest
                     } else if (manifest.type === 'update') {
+                        if (!verifyManifest(manifest, currentServerId)) {
+                            logger.error('[MAST] Update manifest signature invalid — ignoring');
+                            return;
+                        }
                         globalManifest = manifest;
                         stopThrobber();
                         handlePushUpdate(manifest);
@@ -219,11 +249,9 @@ function ask(question) {
     return new Promise(resolve => rl.question(question, answer => { rl.close(); resolve(answer); }));
 }
 
-async function worker(id, manifest, pendingQueue, downloadDir, onProgress) {
+async function worker(id, manifest, selectedFiles, pendingQueue, downloadDir, onProgress) {
     return new Promise((resolve, reject) => {
-        const socket = net.createConnection(manifest.data_port, HOST, () => {
-            requestNext();
-        });
+        const socket = net.createConnection({ port: manifest.data_port, host: HOST });
         let buffer = Buffer.alloc(0);
         function requestNext() {
             const next = pendingQueue.shift();
@@ -240,6 +268,7 @@ async function worker(id, manifest, pendingQueue, downloadDir, onProgress) {
             req.writeUInt32BE(next, 32);
             socket.write(req);
         }
+        socket.on('connect', requestNext);
         socket.on('data', (chunk) => {
             buffer = Buffer.concat([buffer, chunk]);
             if (buffer.length >= 8) {
@@ -250,7 +279,7 @@ async function worker(id, manifest, pendingQueue, downloadDir, onProgress) {
                     const chunkData = decrypt(encryptedChunk, sharedSecret);
 
                     const chunkStart = chunkId * manifest.chunk_size;
-                    manifest.files.forEach(f => {
+                    selectedFiles.forEach(f => { // only write to files selected for this download
                         const fileStart = f.offset;
                         const fileEnd = f.offset + f.size;
                         if (chunkStart + chunkData.length > fileStart && chunkStart < fileEnd) {
@@ -259,9 +288,13 @@ async function worker(id, manifest, pendingQueue, downloadDir, onProgress) {
                             const writeStartInFile = Math.max(0, chunkStart - fileStart);
 
                             const filePath = path.join(downloadDir, f.path);
-                            const fd = fs.openSync(filePath, 'r+');
-                            fs.writeSync(fd, chunkData, sliceStart, sliceEnd - sliceStart, writeStartInFile);
-                            fs.closeSync(fd);
+                            try {
+                                const fd = fs.openSync(filePath, 'r+');
+                                fs.writeSync(fd, chunkData, sliceStart, sliceEnd - sliceStart, writeStartInFile);
+                                fs.closeSync(fd);
+                            } catch (err) {
+                                logger.error(`[Worker ${id}] Failed to write to ${f.path}: ${err.message}`);
+                            }
                         }
                     });
 
@@ -272,7 +305,10 @@ async function worker(id, manifest, pendingQueue, downloadDir, onProgress) {
             }
         });
         socket.on('end', resolve);
-        socket.on('error', reject);
+        socket.on('error', (err) => {
+            console.error(`[Worker ${id}] Connection error: ${err.message}`);
+            resolve();
+        });
     });
 }
 
@@ -314,17 +350,85 @@ async function main() {
             });
             const downloadDir = path.join(__dirname, 'downloads');
             if (!fs.existsSync(downloadDir)) fs.mkdirSync(downloadDir);
+            
+            // Categorise each selected file: identical (skip), changed (confirm), new (download)
+            const identicalFiles = [];
+            const changedFiles   = [];
+            const skippedByUser  = new Set();
+
             selectedFiles.forEach(f => {
                 const filePath = path.join(downloadDir, f.path);
-                const fileDir = path.dirname(filePath);
-                if (!fs.existsSync(fileDir)) fs.mkdirSync(fileDir, { recursive: true });
-
-                const fd = fs.openSync(filePath, 'w');
-                if (f.size > 0) {
-                    fs.writeSync(fd, Buffer.alloc(1), 0, 1, f.size - 1);
+                if (fs.existsSync(filePath)) {
+                    const localHash  = computeFileHash(filePath);
+                    const remoteHash = f.sha256 || null;
+                    if (localHash && remoteHash && localHash === remoteHash) {
+                        identicalFiles.push(f);
+                    } else {
+                        changedFiles.push({ f, localHash, remoteHash });
+                    }
                 }
-                fs.closeSync(fd);
             });
+
+            if (identicalFiles.length > 0) {
+                logger.important(`[MAST] ${identicalFiles.length} file(s) already up to date — skipping:`, logger.colors.green);
+                identicalFiles.forEach(f => console.log(`  \x1b[32m✓\x1b[0m ${f.path}`));
+            }
+
+            if (changedFiles.length > 0) {
+                console.log();
+                logger.important(`[MAST] ${changedFiles.length} file(s) differ from remote:`, logger.colors.yellow);
+                for (const { f, localHash, remoteHash } of changedFiles) {
+                    console.log(`  \x1b[33m⚠\x1b[0m ${f.path} (${formatBytes(f.size)})`);
+                    console.log(`    \x1b[90mLocal  SHA-256: ${localHash  || 'unreadable'}\x1b[0m`);
+                    console.log(`    \x1b[90mRemote SHA-256: ${remoteHash || 'unavailable'}\x1b[0m`);
+                }
+                const answer = await ask('\nOverwrite changed file(s)? (yes/no/select): ');
+                if (answer.toLowerCase() === 'select') {
+                    for (const { f, localHash, remoteHash } of changedFiles) {
+                        const yn = await ask(`  Overwrite ${f.path}? (yes/no): `);
+                        if (yn.toLowerCase() !== 'yes' && yn.toLowerCase() !== 'y') skippedByUser.add(f.path);
+                    }
+                } else if (answer.toLowerCase() !== 'yes' && answer.toLowerCase() !== 'y') {
+                    changedFiles.forEach(({ f }) => skippedByUser.add(f.path));
+                }
+            }
+
+            // Final download set: new files + changed files the user approved; drop identical and skipped
+            selectedFiles = selectedFiles.filter(f => {
+                if (identicalFiles.includes(f))  return false;
+                if (skippedByUser.has(f.path))   return false;
+                return true;
+            });
+            if (selectedFiles.length === 0) {
+                logger.important('[MAST] Nothing to download.', logger.colors.cyan);
+                continue;
+            }
+
+            // Recompute needed chunks for the final download set
+            neededChunkIds.clear();
+            selectedFiles.forEach(f => {
+                const startChunk = Math.floor(f.offset / globalManifest.chunk_size);
+                const endChunk   = Math.floor((f.offset + f.size - 1) / globalManifest.chunk_size);
+                for (let i = startChunk; i <= endChunk; i++) neededChunkIds.add(i);
+            });
+            
+            try {
+                selectedFiles.forEach(f => {
+                    const filePath = path.join(downloadDir, f.path);
+                    const fileDir = path.dirname(filePath);
+                    if (!fs.existsSync(fileDir)) fs.mkdirSync(fileDir, { recursive: true });
+
+                    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                    const fd = fs.openSync(filePath, 'w');
+                    if (f.size > 0) {
+                        fs.writeSync(fd, Buffer.alloc(1), 0, 1, f.size - 1);
+                    }
+                    fs.closeSync(fd);
+                });
+            } catch (e) {
+                logger.error(`[MAST] File pre-allocation failed: ${e.message}`);
+                continue;
+            }
 
             const pendingQueue = Array.from(neededChunkIds);
             const totalChunks = pendingQueue.length;
@@ -344,7 +448,7 @@ async function main() {
 
             const streams = [];
             for (let i = 0; i < optimalStreams; i++) {
-                streams.push(worker(i, globalManifest, pendingQueue, downloadDir, () => {
+                streams.push(worker(i, globalManifest, selectedFiles, pendingQueue, downloadDir, () => {
                     completedChunks++;
                     drawProgressBar(completedChunks, totalChunks, globalManifest.chunk_size);
                 }));

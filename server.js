@@ -97,6 +97,7 @@ async function initServer() {
 
     const activeSessions = new Map();
     const subscribers = new Set();
+    let datasetVersion = 1;
 
     logger.important(`[MAST] Ready: ${dataset.manifestFiles.length} files | ${dataset.chunkCount} chunks | ${formatBytes(dataset.totalSize)}`, logger.colors.green);
 
@@ -107,6 +108,10 @@ async function initServer() {
         dataset = prepareDataset(targetPath);
         tree = await buildMerkleTree(dataset);
         masterHash = getRoot(tree).toString('hex');
+        datasetVersion++;
+        for (const [sessionId, session] of activeSessions.entries()) {
+            session.version = datasetVersion;
+        }
         stopThrobber();
         const manifest = {
             type: 'update',
@@ -147,6 +152,10 @@ async function initServer() {
             const chunkId = data.readUInt32BE(32);
             const session = activeSessions.get(sessionId);
             if (!session) return;
+            if (session.version !== datasetVersion) {
+                logger.all(`[MAST] Rejecting stale chunk request from old dataset version`);
+                return;
+            }
             if (chunkId < dataset.chunkCount) {
                 const { readChunk } = require('./lib/files');
                 const chunkData = readChunk(dataset, chunkId);
@@ -199,7 +208,7 @@ async function initServer() {
                         publicKey: clientXPub
                     });
                     const sessionId = crypto.randomBytes(32).toString('hex');
-                    activeSessions.set(sessionId, { secret, clientPub });
+                    activeSessions.set(sessionId, { secret, clientPub, version: datasetVersion });
                     const fingerprint = getFingerprint(secret);
                     logger.important(`[MAST] Secure handshake with client [${clientPub.slice(0, 16)}...]`, logger.colors.green);
                     logger.all(`[MAST] Session Fingerprint: ${fingerprint}`);
