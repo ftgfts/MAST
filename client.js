@@ -7,10 +7,32 @@ const { hash, buildMerkleTree, getRoot, getProof, verifyProof } = require('./lib
 const { getOrGenerateKey, getXKey, sign, verify, decrypt, getFingerprint } = require('./lib/auth');
 const logger = require('./lib/logger');
 
-const BOOTSTRAP_PORT = process.argv[2] || 3000;
-const serverPubPath = process.argv[3];
-const MAX_STREAMS = parseInt(process.argv[4]) || 8;
-const HOST = process.argv[5] || '127.0.0.1';
+function getArg(flag, short, defaultValue) {
+    const idx = process.argv.findIndex(a => a === flag || a === short);
+    if (idx !== -1 && process.argv[idx + 1]) return process.argv[idx + 1];
+    return defaultValue;
+}
+
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+    console.log(`
+MAST Client - Securely receive files and folders
+
+Usage:
+  node client.js [options] [port]
+
+Options:
+  -P, --port <num>       Server bootstrap port (Default: 3000)
+  -k, --key <path>       Path to server's .pub key for verification
+  -s, --streams <num>    Number of parallel streams (Default: 8)
+  -H, --host <addr>      Server IP or hostname (Default: 127.0.0.1)
+    `);
+    process.exit(0);
+}
+
+const BOOTSTRAP_PORT = parseInt(getArg('--port', '-P', process.argv[2] || 3000));
+const serverPubPath = getArg('--key', '-k', process.argv[3]); 
+const MAX_STREAMS = parseInt(getArg('--streams', '-s', process.argv[4] || 8)); 
+const HOST = getArg('--host', '-H', process.argv[5] || '127.0.0.1');
 
 const clientKeys = getOrGenerateKey('client');
 const clientXKeys = getXKey('client');
@@ -25,13 +47,10 @@ async function bootstrap() {
         const socket = net.createConnection(BOOTSTRAP_PORT, HOST, () => {
             logger.all('[Client] Connecting to bootstrap...');
         });
-
         let bootstrapResolved = false;
         let incomingBuffer = Buffer.alloc(0);
-
         socket.on('data', (data) => {
             incomingBuffer = Buffer.concat([incomingBuffer, data]);
-            
             if (!sharedSecret) {
                 try {
                     const str = incomingBuffer.toString();
@@ -45,16 +64,13 @@ async function bootstrap() {
                 } catch (e) {}
                 return;
             }
-
             while (incomingBuffer.length >= 4) {
                 const packetLen = incomingBuffer.readUInt32BE(0);
                 if (incomingBuffer.length >= 4 + packetLen) {
                     const packetData = incomingBuffer.slice(4, 4 + packetLen);
                     incomingBuffer = incomingBuffer.slice(4 + packetLen);
-
                     const decrypted = decrypt(packetData, sharedSecret);
                     const manifest = JSON.parse(decrypted.toString());
-
                     if (manifest.type === 'init' && !bootstrapResolved) {
                         bootstrapResolved = true;
                         resolve(manifest);
@@ -66,7 +82,6 @@ async function bootstrap() {
                 }
             }
         });
-
         socket.on('error', (e) => {
             if (!bootstrapResolved) reject(e);
         });
@@ -77,23 +92,21 @@ function handleHandshakeStep1(res, socket) {
     const nonce = res.nonce;
     const serverPub = res.pub;
     const serverXPubPem = res.xpub;
-
     currentServerId = serverPub;
     logger.important(`[MAST] Verified Sender ID: ${currentServerId}`, logger.colors.green);
-
     if (trustedServerPub && serverPub !== trustedServerPub) {
         logger.error('Connection blocked: Untrusted Sender ID');
         socket.end();
         return;
     }
-
     const signature = sign(nonce, clientKeys.privateKey).toString('hex');
     const serverXPub = crypto.createPublicKey(serverXPubPem);
     sharedSecret = crypto.diffieHellman({
         privateKey: clientXKeys.privateKey,
         publicKey: serverXPub
     });
-
+    const fingerprint = getFingerprint(sharedSecret);
+    logger.all(`[MAST] Session Fingerprint: ${fingerprint}`);
     socket.write(JSON.stringify({
         pub: clientKeys.publicKey,
         xpub: clientXKeys.publicKey.export({ type: 'spki', format: 'pem' }),
@@ -132,9 +145,7 @@ async function worker(id, manifest, pendingQueue, receivedChunks) {
         const socket = net.createConnection(manifest.data_port, HOST, () => {
             requestNext();
         });
-
         let buffer = Buffer.alloc(0);
-
         function requestNext() {
             const next = pendingQueue.shift();
             if (next === undefined) {
@@ -150,7 +161,6 @@ async function worker(id, manifest, pendingQueue, receivedChunks) {
             req.writeUInt32BE(next, 32);
             socket.write(req);
         }
-
         socket.on('data', (chunk) => {
             buffer = Buffer.concat([buffer, chunk]);
             if (buffer.length >= 8) {
@@ -165,7 +175,6 @@ async function worker(id, manifest, pendingQueue, receivedChunks) {
                 }
             }
         });
-
         socket.on('end', resolve);
         socket.on('error', reject);
     });
@@ -175,16 +184,13 @@ async function main() {
     try {
         logger.important('[MAST] Initiating secure session...');
         const manifest = await bootstrap();
-        
         if (!manifest || !manifest.session_id) {
             throw new Error("Handshake failed: No session ID received");
         }
-
         console.log('\n--- Remote File Manifest ---');
         manifest.files.forEach((f, i) => {
             console.log(`\x1b[33m[${i}]\x1b[0m ${truncatePath(f.path)} ${(f.size/1024).toFixed(2)} KB`);
         });
-
         const input = await ask('\nEnter indices (0,1,2), range (0-5), or "all": ');
         let selectedFiles = [];
         if (input.toLowerCase() === 'all') {
@@ -195,7 +201,6 @@ async function main() {
         } else {
             selectedFiles = input.split(',').map(Number).map(i => manifest.files[i]);
         }
-
         const start = Date.now();
         const neededChunkIds = new Set();
         selectedFiles.forEach(f => {
@@ -203,37 +208,27 @@ async function main() {
             const endChunk = Math.floor((f.offset + f.size - 1) / manifest.chunk_size);
             for (let i = startChunk; i <= endChunk; i++) neededChunkIds.add(i);
         });
-
         const pendingQueue = Array.from(neededChunkIds);
         const receivedChunks = new Array(manifest.chunk_count);
-        
         logger.important(`[MAST] Task: ${selectedFiles.length} files | ${pendingQueue.length} chunks`);
-        
         const optimalStreams = pendingQueue.length > 50 ? MAX_STREAMS : Math.min(4, Math.ceil(pendingQueue.length / 2));
         logger.all(`[MAST] Spawning ${optimalStreams} parallel data streams...`);
-        
         const streams = [];
         for (let i = 0; i < optimalStreams; i++) {
             streams.push(worker(i, manifest, pendingQueue, receivedChunks));
         }
-
         await Promise.all(streams);
         const duration = Date.now() - start;
-        
         logger.important(`[MAST] Transfer complete in ${duration}ms`, logger.colors.green);
         logger.all('[MAST] Reconstructing filesystem...');
-
         const downloadDir = path.join(__dirname, 'downloads');
         if (!fs.existsSync(downloadDir)) fs.mkdirSync(downloadDir);
-
         selectedFiles.forEach(f => {
             const filePath = path.join(downloadDir, f.path);
             const fileDir = path.dirname(filePath);
             if (!fs.existsSync(fileDir)) fs.mkdirSync(fileDir, { recursive: true });
-
             const startChunk = Math.floor(f.offset / manifest.chunk_size);
             const endChunk = Math.floor((f.offset + f.size - 1) / manifest.chunk_size);
-            
             const fileBuffers = [];
             for (let i = startChunk; i <= endChunk; i++) {
                 const chunkData = receivedChunks[i];
@@ -242,14 +237,11 @@ async function main() {
                 const sliceEnd = Math.min(chunkData.length, (f.offset + f.size) - chunkStart);
                 fileBuffers.push(chunkData.slice(sliceStart, sliceEnd));
             }
-
             fs.writeFileSync(filePath, Buffer.concat(fileBuffers));
             logger.all(`[Client] Verified and Saved: ${f.path}`);
         });
-
     } catch (e) {
         console.error('[Client] Error:', e.message);
     }
 }
-
 main();

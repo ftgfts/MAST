@@ -4,15 +4,36 @@ const path = require('path');
 const crypto = require('crypto');
 const { buildMerkleTree, getRoot } = require('./lib/merkle');
 const { prepareDataset } = require('./lib/files');
-const { getOrGenerateKey, getXKey, sign, verify, encrypt } = require('./lib/auth');
+const { getOrGenerateKey, getXKey, sign, verify, encrypt, getFingerprint } = require('./lib/auth');
 const logger = require('./lib/logger');
 
-const CHUNK_SIZE = 64 * 1024;
-const STREAM_COUNT = 4;
-const DEFAULT_BOOTSTRAP_PORT = 3000;
+function getArg(flag, short, defaultValue) {
+    const idx = process.argv.findIndex(a => a === flag || a === short);
+    if (idx !== -1 && process.argv[idx + 1]) return process.argv[idx + 1];
+    return defaultValue;
+}
 
-const targetPath = process.argv[2] || '../idea.md';
-const clientPubPath = process.argv[3];
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+    console.log(`
+MAST Server - Securely serve files and folders
+
+Usage:
+  node server.js [options] [path_to_folder]
+
+Options:
+  -p, --path <path>      Local directory to share (Default: ./)
+  -k, --key <path>       Path to authorized client .pub key
+  -s, --streams <num>    Number of parallel streams (Default: 4)
+  -P, --port <num>       Port for bootstrap server (Default: 3000)
+    `);
+    process.exit(0);
+}
+
+const CHUNK_SIZE = 64 * 1024;
+const targetPath = getArg('--path', '-p', process.argv[2] || './');
+const clientPubPath = getArg('--key', '-k', process.argv[3]);
+const STREAM_COUNT = parseInt(getArg('--streams', '-s', process.argv[4] || 4));
+const DEFAULT_BOOTSTRAP_PORT = parseInt(getArg('--port', '-P', process.argv[5] || 3000));
 
 if (!fs.existsSync(targetPath)) {
     logger.error(`Target not found: ${targetPath}`);
@@ -28,6 +49,7 @@ logger.important(`[MAST] Initialized ID: ${serverKeys.publicKey}`);
 let dataset = prepareDataset(targetPath);
 let tree = buildMerkleTree(dataset.chunks);
 let masterHash = getRoot(tree).toString('hex');
+
 const activeSessions = new Map();
 const subscribers = new Set();
 
@@ -38,7 +60,6 @@ function broadcastUpdate() {
     dataset = prepareDataset(targetPath);
     tree = buildMerkleTree(dataset.chunks);
     masterHash = getRoot(tree).toString('hex');
-
     const manifest = {
         type: 'update',
         total_size: dataset.fullBuffer.length,
@@ -48,7 +69,6 @@ function broadcastUpdate() {
         files: dataset.manifestFiles,
         merkle_tree: tree.map(level => level.map(node => node.toString('hex')))
     };
-
     for (const sub of subscribers) {
         try {
             const encrypted = encrypt(Buffer.from(JSON.stringify(manifest)), sub.secret);
@@ -73,15 +93,13 @@ if (fs.statSync(targetPath).isDirectory()) {
 }
 
 const dataServer = net.createServer((socket) => {
-    socket.on('error', () => {});
+    socket.on('error', () => {}); 
     socket.on('data', (data) => {
         if (data.length < 36) return;
         const sessionId = data.slice(0, 32).toString('hex');
         const chunkId = data.readUInt32BE(32);
-        
         const session = activeSessions.get(sessionId);
         if (!session) return;
-
         if (chunkId < dataset.chunks.length) {
             const chunkData = dataset.chunks[chunkId];
             const encryptedChunk = encrypt(chunkData, session.secret);
@@ -97,7 +115,6 @@ const dataServer = net.createServer((socket) => {
 dataServer.listen(0, '::', () => {
     const dataPort = dataServer.address().port;
     logger.important(`[MAST] Data pool active on [::]:${dataPort}`);
-
     const bootstrapServer = net.createServer((socket) => {
         socket.on('error', () => {
             for (const sub of subscribers) {
@@ -107,40 +124,37 @@ dataServer.listen(0, '::', () => {
                 }
             }
         });
-
         const nonce = crypto.randomBytes(32);
-        socket.write(JSON.stringify({ nonce: nonce.toString('hex'), pub: serverKeys.publicKey, xpub: serverXKeys.publicKey.export({ type: 'spki', format: 'pem' }) }));
-
+        socket.write(JSON.stringify({ 
+            nonce: nonce.toString('hex'), 
+            pub: serverKeys.publicKey, 
+            xpub: serverXKeys.publicKey.export({ type: 'spki', format: 'pem' }) 
+        }));
         socket.on('data', (data) => {
             try {
                 const res = JSON.parse(data.toString());
                 if (!res.signature) return;
-
                 const clientPub = res.pub;
                 const clientXPubPem = res.xpub;
                 const signature = Buffer.from(res.signature, 'hex');
-
                 if (authorizedClientPub && clientPub !== authorizedClientPub) {
                     socket.end();
                     return;
                 }
-
                 if (!verify(nonce.toString('hex'), signature, clientPub)) {
                     socket.end();
                     return;
                 }
-
                 const clientXPub = crypto.createPublicKey(clientXPubPem);
                 const secret = crypto.diffieHellman({
                     privateKey: serverXKeys.privateKey,
                     publicKey: clientXPub
                 });
-
                 const sessionId = crypto.randomBytes(32).toString('hex');
                 activeSessions.set(sessionId, { secret, clientPub });
-
+                const fingerprint = getFingerprint(secret);
                 logger.important(`[MAST] Secure handshake with client [${clientPub.slice(0, 16)}...]`, logger.colors.green);
-
+                logger.all(`[MAST] Session Fingerprint: ${fingerprint}`);
                 const manifest = {
                     type: 'init',
                     session_id: sessionId,
@@ -153,21 +167,16 @@ dataServer.listen(0, '::', () => {
                     files: dataset.manifestFiles,
                     merkle_tree: tree.map(level => level.map(node => node.toString('hex')))
                 };
-
                 const encryptedManifest = encrypt(Buffer.from(JSON.stringify(manifest)), secret);
                 const packet = Buffer.alloc(4);
-                packet.writeUInt32BE(encryptedManifest.length, 0);
+                packet.writeUInt32BE(encryptedManifest.length, 0); 
                 socket.write(packet);
                 socket.write(encryptedManifest);
-
                 subscribers.add({ socket, secret });
-            } catch (e) {
-            }
+            } catch (e) {}
         });
     });
-
-    const bootstrapPort = process.env.PORT || DEFAULT_BOOTSTRAP_PORT;
-    bootstrapServer.listen(bootstrapPort, '::', () => {
-        logger.important(`[MAST] Bootstrap listening on [::]:${bootstrapPort}`);
+    bootstrapServer.listen(DEFAULT_BOOTSTRAP_PORT, '::', () => {
+        logger.important(`[MAST] Bootstrap listening on [::]:${DEFAULT_BOOTSTRAP_PORT}`);
     });
 });
