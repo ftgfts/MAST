@@ -175,7 +175,7 @@ async function bootstrap() {
                             logger.error('[MAST] Update manifest signature invalid — ignoring');
                             return;
                         }
-                        globalManifest = manifest;
+                        globalManifest = { ...globalManifest, ...manifest };
                         stopThrobber();
                         handlePushUpdate(manifest);
                     }

@@ -103,6 +103,7 @@ async function initServer() {
     const activeSessions = new Map();
     const subscribers = new Set();
     let datasetVersion = 1;
+    let dataPort = null;
 
     logger.important(`[MAST] Ready: ${dataset.manifestFiles.length} files | ${dataset.chunkCount} chunks | ${formatBytes(dataset.totalSize)}`, logger.colors.green);
 
@@ -176,7 +177,7 @@ async function initServer() {
     });
 
     dataServer.listen(0, '::', () => {
-        const dataPort = dataServer.address().port;
+        dataPort = dataServer.address().port;
         logger.important(`[MAST] Data pool active on [::]:${dataPort}`);
         const bootstrapServer = net.createServer((socket) => {
             socket.on('error', () => {
