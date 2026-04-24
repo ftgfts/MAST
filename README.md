@@ -92,7 +92,7 @@ node client.js -H 127.0.0.1 -P 3000 -s 8
 
 ---
 
-## Security Audit
+## Security
 
 - **Handshake**: Ed25519 signatures verify that the sender owns their ID.
 - **Session Keys**: X25519 Diffie-Hellman provides Perfect Forward Secrecy.
