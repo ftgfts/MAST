@@ -60,33 +60,35 @@ Run the wrapper to start an interactive session:
 node mast.js
 ```
 
-### Manual Mode
+### Manual Mode (Advanced)
+
+For full control over the protocol, you can use the individual scripts with standard flags.
 
 **Serve a folder:**
 
 ```bash
-node server.js <path_to_folder> [trusted_key_path] [max_streams] [bind_port]
+node server.js -p ./my_folder -P 3000
 ```
 
-| Argument | Description | Default / Example |
+| Flag | Description | Default |
 | :--- | :--- | :--- |
-| `<path_to_folder>` | The local directory to share. | `./` (Current dir) |
-| `[trusted_key_path]` | Path to a `.pub` file for ID verification. | `none` (Accept any) |
-| `[max_streams]` | Max parallel workers. | `8` |
-| `[bind_port]` | Port for the bootstrap server. | `3000` |
+| `-p, --path` | The local directory to share. | `./` |
+| `-k, --key` | Path to an authorized client `.pub` key. | `none` |
+| `-s, --streams` | Suggested stream count for clients. | `4` |
+| `-P, --port` | Port for the bootstrap server. | `3000` |
 
 **Receive files:**
 
 ```bash
-node client.js <port> [trusted_key_path] [streams] [address]
+node client.js -H 127.0.0.1 -P 3000 -s 8
 ```
 
-| Argument | Description | Default / Example |
+| Flag | Description | Default |
 | :--- | :--- | :--- |
-| `<port>` | The server's bootstrap port. | `3000` |
-| `[trusted_key_path]` | Path to a `.pub` file for ID verification. | `none` |
-| `[streams]` | Number of parallel data streams to open. | `8` |
-| `[address]` | The IP or hostname of the server. | `127.0.0.1` |
+| `-P, --port` | The server's bootstrap port. | `3000` |
+| `-k, --key` | Path to the server's `.pub` key. | `none` |
+| `-s, --streams` | Number of parallel streams to open. | `8` |
+| `-H, --host` | The IP or hostname of the server. | `127.0.0.1` |
 
 ---
 
