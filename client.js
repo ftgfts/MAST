@@ -31,8 +31,6 @@ function computeFileHash(filePath) {
     }
 }
 
-// Verify the server's Ed25519 signature over the manifest file hashes.
-// The payload mirrors signManifest() on the server side exactly.
 function verifyManifest(manifest, serverPubHex) {
     try {
         if (!manifest.manifest_sig || !serverPubHex) return false;
@@ -172,7 +170,6 @@ async function bootstrap() {
                         stopThrobber();
                         resolve(manifest);
                     } else if (manifest.type === 'merkle') {
-                        // merkle tree received and verified by server; file hashes come from manifest
                     } else if (manifest.type === 'update') {
                         if (!verifyManifest(manifest, currentServerId)) {
                             logger.error('[MAST] Update manifest signature invalid — ignoring');
@@ -279,7 +276,7 @@ async function worker(id, manifest, selectedFiles, pendingQueue, downloadDir, on
                     const chunkData = decrypt(encryptedChunk, sharedSecret);
 
                     const chunkStart = chunkId * manifest.chunk_size;
-                    selectedFiles.forEach(f => { // only write to files selected for this download
+                    selectedFiles.forEach(f => {
                         const fileStart = f.offset;
                         const fileEnd = f.offset + f.size;
                         if (chunkStart + chunkData.length > fileStart && chunkStart < fileEnd) {
@@ -350,8 +347,7 @@ async function main() {
             });
             const downloadDir = path.join(__dirname, 'downloads');
             if (!fs.existsSync(downloadDir)) fs.mkdirSync(downloadDir);
-            
-            // Categorise each selected file: identical (skip), changed (confirm), new (download)
+
             const identicalFiles = [];
             const changedFiles   = [];
             const skippedByUser  = new Set();
@@ -393,7 +389,6 @@ async function main() {
                 }
             }
 
-            // Final download set: new files + changed files the user approved; drop identical and skipped
             selectedFiles = selectedFiles.filter(f => {
                 if (identicalFiles.includes(f))  return false;
                 if (skippedByUser.has(f.path))   return false;
@@ -404,7 +399,6 @@ async function main() {
                 continue;
             }
 
-            // Recompute needed chunks for the final download set
             neededChunkIds.clear();
             selectedFiles.forEach(f => {
                 const startChunk = Math.floor(f.offset / globalManifest.chunk_size);
