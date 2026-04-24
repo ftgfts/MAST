@@ -45,8 +45,8 @@ async function interactive() {
         clear();
         spawn('node', ['server.js', file], { stdio: 'inherit' });
     } else if (action === '2' || action === 'r' || action === 'receive') {
-        const addr = await ask('Server address (default 127.0.0.1): ') || '127.0.0.1';
         const port = await ask('Server port (default 3000): ') || '3000';
+        const addr = await ask('Server address (default 127.0.0.1): ') || '127.0.0.1';
         clear();
         spawn('node', ['client.js', port, 'none', '8', addr], { stdio: 'inherit' });
     } else if (action === 'k' || action === 'keys') {
@@ -69,9 +69,9 @@ if (command === 'serve' || command === 's') {
     const cp = process.argv[4];
     spawn('node', ['server.js', p, cp], { stdio: 'inherit' });
 } else if (command === 'receive' || command === 'r') {
-    const p = process.argv[3];
-    const sp = process.argv[4];
-    spawn('node', ['client.js', p, sp], { stdio: 'inherit' });
+    const addr = process.argv[3] || '127.0.0.1';
+    const port = process.argv[4] || '3000';
+    spawn('node', ['client.js', port, 'none', '8', addr], { stdio: 'inherit' });
 } else if (command === 'keys' || command === 'k') {
     showKeys();
 } else if (command === 'help' || command === 'h') {

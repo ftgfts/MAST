@@ -78,6 +78,11 @@ const serverKeys = getOrGenerateKey('server');
 const serverXKeys = getXKey('server');
 let authorizedClientPub = clientPubPath ? fs.readFileSync(clientPubPath, 'utf8') : null;
 
+function signManifest(masterHash, files) {
+    const payload = masterHash + files.map(f => f.path + ':' + (f.sha256 || '')).join('|');
+    return sign(payload, serverKeys.privateKey).toString('hex');
+}
+
 async function initServer() {
     clear();
     console.log(`\x1b[35m           
@@ -119,6 +124,7 @@ async function initServer() {
             chunk_count: dataset.chunkCount,
             chunk_size: dataset.CHUNK_SIZE,
             master_hash: masterHash,
+            manifest_sig: signManifest(masterHash, dataset.manifestFiles),
             files: dataset.manifestFiles
         };
         for (const sub of subscribers) {
@@ -221,6 +227,7 @@ async function initServer() {
                         stream_count: STREAM_COUNT,
                         data_port: dataPort,
                         master_hash: masterHash,
+                        manifest_sig: signManifest(masterHash, dataset.manifestFiles),
                         files: dataset.manifestFiles
                     };
                     const encryptedManifest = encrypt(Buffer.from(JSON.stringify(manifest)), secret);
