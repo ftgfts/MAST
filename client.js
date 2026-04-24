@@ -60,7 +60,7 @@ Options:
 
 const BOOTSTRAP_PORT = parseInt(getArg('--port', '-P', process.argv[2] || 3000));
 const serverPubPath = getArg('--key', '-k', process.argv[3]);
-const MAX_STREAMS = parseInt(getArg('--streams', '-s', process.argv[4] || 8));
+const MAX_STREAMS = parseInt(getArg('--streams', '-s', process.argv[4] || 16));
 const HOST = getArg('--host', '-H', process.argv[5] || '127.0.0.1');
 
 const clientKeys = getOrGenerateKey('client');
@@ -106,6 +106,19 @@ function printHeader() {
 |_|_|_|__|__|_____| |_|  
 \x1b[0m`);
     logger.important('--------------------------------------------------');
+}
+
+const fdCache = new Map();
+function getCachedFd(filePath, mode = 'r') {
+    const key = `${filePath}:${mode}`;
+    if (fdCache.has(key)) return fdCache.get(key);
+    try {
+        const fd = fs.openSync(filePath, mode);
+        fdCache.set(key, fd);
+        return fd;
+    } catch (e) {
+        return null;
+    }
 }
 
 let lastSpeedUpdate = Date.now();
@@ -211,7 +224,7 @@ function handleHandshakeStep1(res, socket) {
         publicKey: serverXPub
     });
     const fingerprint = getFingerprint(sharedSecret);
-    logger.all(`[MAST] Session Fingerprint: ${fingerprint}`);
+    logger.important(`[MAST] Session Fingerprint: ${fingerprint}`);
     socket.write(JSON.stringify({
         pub: clientKeys.publicKey,
         xpub: clientXKeys.publicKey.export({ type: 'spki', format: 'pem' }),
@@ -231,7 +244,7 @@ function handlePushUpdate(manifest) {
     printHeader();
     if (currentServerId) {
         logger.important(`[MAST] Verified Sender ID: ${currentServerId.slice(0, 64)}...`, logger.colors.green);
-        if (sharedSecret) logger.all(`[MAST] Session Fingerprint: ${getFingerprint(sharedSecret)}`);
+        if (sharedSecret) logger.important(`[MAST] Session Fingerprint: ${getFingerprint(sharedSecret)}`);
         console.log('--------------------------------------------------');
     }
     logger.important('[MAST] Remote update pushed! New file list:', logger.colors.yellow);
@@ -286,9 +299,8 @@ async function worker(id, manifest, selectedFiles, pendingQueue, downloadDir, on
 
                             const filePath = path.join(downloadDir, f.path);
                             try {
-                                const fd = fs.openSync(filePath, 'r+');
-                                fs.writeSync(fd, chunkData, sliceStart, sliceEnd - sliceStart, writeStartInFile);
-                                fs.closeSync(fd);
+                                const fd = getCachedFd(filePath, 'r+');
+                                if (fd) fs.writeSync(fd, chunkData, sliceStart, sliceEnd - sliceStart, writeStartInFile);
                             } catch (err) {
                                 logger.error(`[Worker ${id}] Failed to write to ${f.path}: ${err.message}`);
                             }
@@ -450,7 +462,7 @@ async function main() {
             await Promise.all(streams);
             const duration = Date.now() - start;
             console.log();
-            logger.important(`[MAST] Transfer complete in ${duration}ms`, logger.colors.green);
+            logger.important(`[MAST] Transfer complete in ${duration}ms | ${optimalStreams} streams | ${HOST}:${globalManifest.data_port}`, logger.colors.green);
             logger.all('[MAST] Verified and Saved files.');
 
             await ask('\nPress Enter to continue downloading...');

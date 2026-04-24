@@ -218,7 +218,7 @@ async function initServer() {
                     activeSessions.set(sessionId, { secret, clientPub, version: datasetVersion });
                     const fingerprint = getFingerprint(secret);
                     logger.important(`[MAST] Secure handshake with client [${clientPub.slice(0, 16)}...]`, logger.colors.green);
-                    logger.all(`[MAST] Session Fingerprint: ${fingerprint}`);
+                    logger.important(`[MAST] Session Fingerprint: ${fingerprint}`);
                     const manifest = {
                         type: 'init',
                         session_id: sessionId,
