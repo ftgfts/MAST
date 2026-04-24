@@ -1,0 +1,9 @@
+{
+  "log_level": "ALL",
+  "default_bootstrap_port": 3000,
+  "max_streams": 8,
+  "chunk_size": 65536,
+  "identities_dir": "./identities",
+  "download_dir": "./downloads",
+  "log_file": "mast.log"
+}
