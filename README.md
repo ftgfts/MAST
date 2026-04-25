@@ -7,7 +7,6 @@ MAST is a high-performance, secure file transfer protocol designed to thrive on 
 - **Parallel Streaming Engine**: Utilizes multiple concurrent data streams to saturate available bandwidth regardless of network latency or RTT.
 - **Merkle-Based Integrity**: Every data chunk is verified against a Merkle Root in real-time. If a single bit is corrupted, only the affected chunk is re-transmitted.
 - **Secure by Design**: End-to-end encryption using X25519 key exchange and AES-256-GCM, with Ed25519 identities for persistent, trusted sessions.
-- **Darknet Optimized**: Specific architectural considerations for I2P single-thread limits, Tor circuit jitter, and Yggdrasil IPv6 mesh routing.
 - **Live Sync**: Native filesystem watching triggers encrypted manifest pushes to all active subscribers.
 
 ---
