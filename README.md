@@ -1,6 +1,6 @@
 # MAST: Merkle Addressed Streaming Transfer
 
-MAST is a high-performance, secure file transfer protocol designed to thrive on high-latency overlay networks and standard clearnet links alike. By combining Merkle-tree content addressing with an 8-way parallel streaming engine, MAST bypasses the "sequential bottleneck" that plagues traditional TCP transfers over darknets like I2P and Tor.
+MAST is a high-performance, secure file transfer protocol designed to thrive on high-latency overlay networks and standard clearnet links alike. By combining Merkle-tree content addressing with an 8-way parallel streaming engine, MAST bypasses the "sequential bottleneck" that plagues traditional TCP transfers.
 
 ## Key Features
 
@@ -43,10 +43,6 @@ The bootstrap server listens on port 3000 by default. Forward this port on your 
 ### Yggdrasil / Mesh Networks
 
 MAST binds to `::` (all interfaces), providing native support for IPv6 mesh networks. Simply provide the server's Yggdrasil IPv6 address to the client.
-
-### Tor / I2P (Darknets)
-
-Use a local tunnel manager (like `i2pd` or `tor`) to point an Onion or I2P address to the server's bootstrap port. MAST's parallel engine will automatically compensate for the high latency of these networks.
 
 ---
 
@@ -92,9 +88,11 @@ node client.js -H 127.0.0.1 -P 3000 -s 8
 
 ---
 
-## Security
+## Security Features
 
 - **Handshake**: Ed25519 signatures verify that the sender owns their ID.
 - **Session Keys**: X25519 Diffie-Hellman provides Perfect Forward Secrecy.
 - **Fingerprinting**: A 16-character SHA-256 fingerprint is displayed to both parties for out-of-band verification.
 - **Encryption**: AES-256-GCM ensures both confidentiality and data authenticity.
+
+PROTOTYPE
