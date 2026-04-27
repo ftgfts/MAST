@@ -38,7 +38,7 @@ async function showWelcome() {
 async function interactive() {
     await showWelcome();
     const action = (await ask('Action: (s)erve, (r)eceive, (k)eys, (h)elp: ')).toLowerCase();
-    
+
     if (action === '1' || action === 's' || action === 'serve') {
         const file = await ask('Path to file or folder: ');
         if (!file) return;
@@ -48,7 +48,7 @@ async function interactive() {
         const port = await ask('Server port (default 3000): ') || '3000';
         const addr = await ask('Server address (default 127.0.0.1): ') || '127.0.0.1';
         clear();
-        spawn('node', ['client.js', port, 'none', '8', addr], { stdio: 'inherit' });
+        spawn('node', ['client.js', port, 'none', '16', addr], { stdio: 'inherit' });
     } else if (action === 'k' || action === 'keys') {
         showKeys();
     } else {
@@ -71,7 +71,7 @@ if (command === 'serve' || command === 's') {
 } else if (command === 'receive' || command === 'r') {
     const addr = process.argv[3] || '127.0.0.1';
     const port = process.argv[4] || '3000';
-    spawn('node', ['client.js', port, 'none', '8', addr], { stdio: 'inherit' });
+    spawn('node', ['client.js', port, 'none', '16', addr], { stdio: 'inherit' });
 } else if (command === 'keys' || command === 'k') {
     showKeys();
 } else if (command === 'help' || command === 'h') {

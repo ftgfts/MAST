@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { buildMerkleTree, getRoot } = require('./lib/merkle');
-const { prepareDataset } = require('./lib/files');
+const { prepareDataset, readChunk } = require('./lib/files');
 const { getOrGenerateKey, getXKey, sign, verify, encrypt, getFingerprint } = require('./lib/auth');
 const logger = require('./lib/logger');
 
@@ -64,7 +64,7 @@ Options:
     process.exit(0);
 }
 
-const targetPath = getArg('--path', '-p', process.argv[2] || './');
+let targetPath = getArg('--path', '-p', process.argv[2] || './');
 const clientPubPath = getArg('--key', '-k', process.argv[3]);
 const STREAM_COUNT = parseInt(getArg('--streams', '-s', process.argv[4] || 4));
 const DEFAULT_BOOTSTRAP_PORT = parseInt(getArg('--port', '-P', process.argv[5] || 3000));
@@ -86,10 +86,11 @@ function signManifest(masterHash, files) {
 async function initServer() {
     clear();
     console.log(`\x1b[35m           
- _____ _____ _____ _____ 
-|     |  _  |   __|_   _|
-| | | |     |__   | | |  
-|_|_|_|__|__|_____| |_|  
+                              
+██▄  ▄██ ▄████▄ ▄█████ ██████ 
+██ ▀▀ ██ ██▄▄██ ▀▀▀▄▄▄   ██   
+██    ██ ██  ██ █████▀   ██   
+                              
 \x1b[0m`);
     logger.important('--------------------------------------------------');
     logger.important(`[MAST] Initialized ID: ${serverKeys.publicKey.slice(0, 64)}...`);
@@ -107,7 +108,7 @@ async function initServer() {
 
     logger.important(`[MAST] Ready: ${dataset.manifestFiles.length} files | ${dataset.chunkCount} chunks | ${formatBytes(dataset.totalSize)}`, logger.colors.green);
 
-    async function broadcastUpdate() {
+    async function broadcastUpdate(resetDir = false) {
         stopThrobber();
         logger.important('[MAST] Change detected! Rebuilding and pushing update...', logger.colors.yellow);
         startThrobber('[MAST] Rebuilding dataset and Merkle tree...');
@@ -121,6 +122,7 @@ async function initServer() {
         stopThrobber();
         const manifest = {
             type: 'update',
+            reset_dir: resetDir,
             total_size: dataset.totalSize,
             chunk_count: dataset.chunkCount,
             chunk_size: dataset.CHUNK_SIZE,
@@ -141,37 +143,52 @@ async function initServer() {
         }
     }
 
-    if (fs.statSync(targetPath).isDirectory()) {
-        let watchTimeout;
-        fs.watch(targetPath, { recursive: true }, (event, filename) => {
-            if (filename) {
-                clearTimeout(watchTimeout);
-                watchTimeout = setTimeout(broadcastUpdate, 500);
-            }
-        });
+    let currentWatcher = null;
+    function setupWatcher(dir) {
+        if (currentWatcher) currentWatcher.close();
+        if (fs.statSync(dir).isDirectory()) {
+            let watchTimeout;
+            currentWatcher = fs.watch(dir, { recursive: true }, (event, filename) => {
+                if (filename) {
+                    clearTimeout(watchTimeout);
+                    watchTimeout = setTimeout(() => broadcastUpdate(false), 500);
+                }
+            });
+        }
     }
+    setupWatcher(targetPath);
 
     const dataServer = net.createServer((socket) => {
-        socket.on('error', () => {}); 
+        socket.on('error', () => { });
         socket.on('data', (data) => {
-            if (data.length < 36) return;
-            const sessionId = data.slice(0, 32).toString('hex');
-            const chunkId = data.readUInt32BE(32);
-            const session = activeSessions.get(sessionId);
-            if (!session) return;
-            if (session.version !== datasetVersion) {
-                logger.all(`[MAST] Rejecting stale chunk request from old dataset version`);
-                return;
-            }
-            if (chunkId < dataset.chunkCount) {
-                const { readChunk } = require('./lib/files');
-                const chunkData = readChunk(dataset, chunkId);
-                const encryptedChunk = encrypt(chunkData, session.secret);
-                const header = Buffer.alloc(8);
-                header.writeUInt32BE(chunkId, 0);
-                header.writeUInt32BE(encryptedChunk.length, 4);
-                socket.write(header);
-                socket.write(encryptedChunk);
+            socket.requestBuffer = socket.requestBuffer ? Buffer.concat([socket.requestBuffer, data]) : data;
+
+            while (socket.requestBuffer.length >= 36) {
+                const reqData = socket.requestBuffer.slice(0, 36);
+                socket.requestBuffer = socket.requestBuffer.slice(36);
+
+                const sessionId = reqData.slice(0, 32).toString('hex');
+                const chunkId = reqData.readUInt32BE(32);
+
+                const session = activeSessions.get(sessionId);
+                if (!session) continue;
+
+                if (session.version !== datasetVersion) {
+                    logger.all(`[MAST] Rejecting stale chunk request from old dataset version`);
+                    continue;
+                }
+
+                if (chunkId < dataset.chunkCount) {
+                    const chunkData = readChunk(dataset, chunkId);
+                    const encryptedChunk = encrypt(chunkData, session.secret);
+
+                    const header = Buffer.alloc(8);
+                    header.writeUInt32BE(chunkId, 0);
+                    header.writeUInt32BE(encryptedChunk.length, 4);
+
+                    socket.write(header);
+                    socket.write(encryptedChunk);
+                }
             }
         });
     });
@@ -189,10 +206,10 @@ async function initServer() {
                 }
             });
             const nonce = crypto.randomBytes(32);
-            socket.write(JSON.stringify({ 
-                nonce: nonce.toString('hex'), 
-                pub: serverKeys.publicKey, 
-                xpub: serverXKeys.publicKey.export({ type: 'spki', format: 'pem' }) 
+            socket.write(JSON.stringify({
+                nonce: nonce.toString('hex'),
+                pub: serverKeys.publicKey,
+                xpub: serverXKeys.publicKey.export({ type: 'spki', format: 'pem' })
             }));
             socket.on('data', (data) => {
                 try {
@@ -233,10 +250,10 @@ async function initServer() {
                     };
                     const encryptedManifest = encrypt(Buffer.from(JSON.stringify(manifest)), secret);
                     const packet = Buffer.alloc(4);
-                    packet.writeUInt32BE(encryptedManifest.length, 0); 
+                    packet.writeUInt32BE(encryptedManifest.length, 0);
                     socket.write(packet);
                     socket.write(encryptedManifest);
-                    
+
                     const merkleData = {
                         type: 'merkle',
                         merkle_tree: tree.map(level => level.map(node => node.toString('hex')))
@@ -248,11 +265,81 @@ async function initServer() {
                     socket.write(encMerkle);
 
                     subscribers.add({ socket, secret });
-                } catch (e) {}
+                } catch (e) { }
             });
         });
         bootstrapServer.listen(DEFAULT_BOOTSTRAP_PORT, '::', () => {
             logger.important(`[MAST] Bootstrap listening on [::]:${DEFAULT_BOOTSTRAP_PORT}`);
+
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.setEncoding('utf8');
+
+            global.stickyMenuText = '\n--- Server Options ---\n[1] Change Shared Directory\n[2] Exit\n\x1b[36m> \x1b[0m';
+            global.stickyMenuLines = 4;
+            global.stickyMenuActive = false;
+            global.isPrompting = false;
+
+            global.clearStickyMenu = () => {
+                if (global.stickyMenuActive) {
+                    process.stdout.write(`\r\x1b[${global.stickyMenuLines}A\x1b[J`);
+                    global.stickyMenuActive = false;
+                }
+            };
+
+            global.drawStickyMenu = () => {
+                if (!global.stickyMenuActive && !global.isPrompting) {
+                    process.stdout.write(global.stickyMenuText);
+                    global.stickyMenuActive = true;
+                }
+            };
+
+            global.drawStickyMenu();
+
+            process.stdin.on('data', async (key) => {
+                if (global.isPrompting) return;
+
+                if (key === '1') {
+                    global.clearStickyMenu();
+                    global.isPrompting = true;
+
+                    if (currentWatcher) {
+                        currentWatcher.close();
+                        currentWatcher = null;
+                    }
+
+                    process.stdin.setRawMode(false);
+                    const readline = require('readline');
+                    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+                    rl.question('Enter new directory path: ', async (newPath) => {
+                        rl.close();
+                        process.stdin.setRawMode(true);
+                        global.isPrompting = false;
+                        try {
+                            if (!newPath || !fs.existsSync(newPath) || !fs.statSync(newPath).isDirectory()) {
+                                logger.error(`Directory not found: ${newPath || '(empty)'}`);
+                                setupWatcher(targetPath);
+                            } else {
+                                targetPath = newPath;
+                                const { clearFdCache } = require('./lib/files');
+                                clearFdCache();
+                                setupWatcher(targetPath);
+                                await broadcastUpdate(true);
+                            }
+                        } catch (e) {
+                            logger.error(`Failed to access directory: ${e.message}`);
+                            setupWatcher(targetPath);
+                        }
+                        global.drawStickyMenu();
+                    });
+                } else if (key === '2' || key === '\u0003') {
+                    if (currentWatcher) {
+                        currentWatcher.close();
+                        currentWatcher = null;
+                    }
+                    process.exit(0);
+                }
+            });
         });
     });
 }

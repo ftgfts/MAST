@@ -71,6 +71,8 @@ let trustedServerPub = (serverPubPath && serverPubPath !== 'none' && fs.existsSy
 let sharedSecret = null;
 let currentServerId = null;
 let globalManifest = null;
+let globalCurrentDir = '';
+let updateReceived = false;
 
 let throbberInterval = null;
 const throbberFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -99,11 +101,12 @@ function clear() {
 }
 
 function printHeader() {
-    console.log(`\x1b[35m  
- _____ _____ _____ _____ 
-|     |  _  |   __|_   _|
-| | | |     |__   | | |  
-|_|_|_|__|__|_____| |_|  
+    console.log(`\x1b[35m              
+                              
+██▄  ▄██ ▄████▄ ▄█████ ██████ 
+██ ▀▀ ██ ██▄▄██ ▀▀▀▄▄▄   ██   
+██    ██ ██  ██ █████▀   ██   
+                              
 \x1b[0m`);
     logger.important('--------------------------------------------------');
 }
@@ -121,6 +124,13 @@ function getCachedFd(filePath, mode = 'r') {
     }
 }
 
+function clearFdCache() {
+    for (const [key, fd] of fdCache.entries()) {
+        try { fs.closeSync(fd); } catch (e) { }
+    }
+    fdCache.clear();
+}
+
 let lastSpeedUpdate = Date.now();
 let lastCompleted = 0;
 let currentMbps = 0;
@@ -130,7 +140,7 @@ function drawProgressBar(completed, total, chunkSize) {
     const elapsed = (now - lastSpeedUpdate) / 1000;
     if (elapsed >= 1) {
         const delta = completed - lastCompleted;
-        currentMbps = (delta * (chunkSize || 64 * 1024) * 8) / (1024 * 1024) / elapsed;
+        currentMbps = (delta * (chunkSize || 64 * 1024) * 16) / (1024 * 1024) / elapsed;
         lastSpeedUpdate = now;
         lastCompleted = completed;
     }
@@ -143,63 +153,107 @@ function drawProgressBar(completed, total, chunkSize) {
     process.stdout.write(`\r\x1b[32m[${bar}]\x1b[0m ${percentage}% (${completed}/${total} chunks)${speedText}`);
 }
 
+let bootstrapSocket = null;
+let serverDisconnected = false;
+let reconnecting = false;
+
 async function bootstrap() {
     return new Promise((resolve, reject) => {
-        const socket = net.createConnection(BOOTSTRAP_PORT, HOST, () => {
-            startThrobber('Connecting to bootstrap server & negotiating handshake...');
-        });
-        let bootstrapResolved = false;
-        let incomingBuffer = Buffer.alloc(0);
-        socket.on('data', (data) => {
-            incomingBuffer = Buffer.concat([incomingBuffer, data]);
-            if (!sharedSecret) {
-                try {
-                    const str = incomingBuffer.toString();
-                    if (str.startsWith('{') && str.includes('}')) {
-                        const endIdx = str.indexOf('}') + 1;
-                        const jsonStr = str.slice(0, endIdx);
-                        const res = JSON.parse(jsonStr);
-                        incomingBuffer = incomingBuffer.slice(Buffer.from(jsonStr).length);
-                        handleHandshakeStep1(res, socket);
-                    }
-                } catch (e) { }
-                return;
-            }
-            while (incomingBuffer.length >= 4) {
-                const packetLen = incomingBuffer.readUInt32BE(0);
-                if (incomingBuffer.length >= 4 + packetLen) {
-                    const packetData = incomingBuffer.slice(4, 4 + packetLen);
-                    incomingBuffer = incomingBuffer.slice(4 + packetLen);
-                    const decrypted = decrypt(packetData, sharedSecret);
-                    const manifest = JSON.parse(decrypted.toString());
-                    if (manifest.type === 'init' && !bootstrapResolved) {
-                        if (!verifyManifest(manifest, currentServerId)) {
-                            stopThrobber();
-                            reject(new Error('Manifest signature verification failed — possible tampering'));
-                            return;
-                        }
-                        globalManifest = manifest;
-                        bootstrapResolved = true;
-                        stopThrobber();
-                        resolve(manifest);
-                    } else if (manifest.type === 'merkle') {
-                    } else if (manifest.type === 'update') {
-                        if (!verifyManifest(manifest, currentServerId)) {
-                            logger.error('[MAST] Update manifest signature invalid — ignoring');
-                            return;
-                        }
-                        globalManifest = { ...globalManifest, ...manifest };
-                        stopThrobber();
-                        handlePushUpdate(manifest);
-                    }
+        function connect() {
+            if (reconnecting) return;
+            serverDisconnected = false;
+
+            const socket = net.createConnection(BOOTSTRAP_PORT, HOST, () => {
+                bootstrapSocket = socket;
+                if (!sharedSecret) {
+                    startThrobber('Connecting to bootstrap server & negotiating handshake...');
                 } else {
-                    break;
+                    startThrobber('Reconnected to server...');
                 }
-            }
-        });
-        socket.on('error', (e) => {
-            if (!bootstrapResolved) reject(e);
-        });
+            });
+
+            let bootstrapResolved = false;
+            let incomingBuffer = Buffer.alloc(0);
+
+            socket.on('data', (data) => {
+                incomingBuffer = Buffer.concat([incomingBuffer, data]);
+                if (!sharedSecret) {
+                    try {
+                        const str = incomingBuffer.toString();
+                        if (str.startsWith('{') && str.includes('}')) {
+                            const endIdx = str.indexOf('}') + 1;
+                            const jsonStr = str.slice(0, endIdx);
+                            const res = JSON.parse(jsonStr);
+                            incomingBuffer = incomingBuffer.slice(Buffer.from(jsonStr).length);
+                            handleHandshakeStep1(res, socket);
+                        }
+                    } catch (e) { }
+                    return;
+                }
+                while (incomingBuffer.length >= 4) {
+                    const packetLen = incomingBuffer.readUInt32BE(0);
+                    if (incomingBuffer.length >= 4 + packetLen) {
+                        const packetData = incomingBuffer.slice(4, 4 + packetLen);
+                        incomingBuffer = incomingBuffer.slice(4 + packetLen);
+                        const decrypted = decrypt(packetData, sharedSecret);
+                        const manifest = JSON.parse(decrypted.toString());
+                        if (manifest.type === 'init' && !bootstrapResolved) {
+                            if (!verifyManifest(manifest, currentServerId)) {
+                                stopThrobber();
+                                reject(new Error('Manifest signature verification failed — possible tampering'));
+                                return;
+                            }
+                            globalManifest = manifest;
+                            bootstrapResolved = true;
+                            stopThrobber();
+                            resolve(manifest);
+                        } else if (manifest.type === 'merkle') {
+                        } else if (manifest.type === 'update') {
+                            if (!verifyManifest(manifest, currentServerId)) {
+                                logger.error('[MAST] Update manifest signature invalid — ignoring');
+                                return;
+                            }
+                            if (manifest.reset_dir) {
+                                globalCurrentDir = '';
+                                clearFdCache();
+                            }
+                            globalManifest = { ...globalManifest, ...manifest };
+                            stopThrobber();
+                            handlePushUpdate(manifest);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            });
+
+            socket.on('error', (e) => {
+                if (!bootstrapResolved) {
+                    stopThrobber();
+                    if (!serverDisconnected) {
+                        serverDisconnected = true;
+                        logger.error(`[MAST] Connection to server lost: ${e.message}`);
+                        logger.important('[MAST] Waiting for server to come back online...', logger.colors.yellow);
+                    }
+                    bootstrapSocket = null;
+                    setTimeout(connect, 3000);
+                }
+            });
+
+            socket.on('close', () => {
+                if (bootstrapSocket === socket) {
+                    bootstrapSocket = null;
+                }
+                if (!serverDisconnected && !bootstrapResolved) {
+                    serverDisconnected = true;
+                    logger.error('[MAST] Server disconnected');
+                    logger.important('[MAST] Waiting for server to come back online...', logger.colors.yellow);
+                    setTimeout(connect, 3000);
+                }
+            });
+        }
+
+        connect();
     });
 }
 
@@ -242,16 +296,17 @@ function truncatePath(p, limit = 40) {
 function handlePushUpdate(manifest) {
     clear();
     printHeader();
+    serverDisconnected = false;
     if (currentServerId) {
         logger.important(`[MAST] Verified Sender ID: ${currentServerId.slice(0, 64)}...`, logger.colors.green);
         if (sharedSecret) logger.important(`[MAST] Session Fingerprint: ${getFingerprint(sharedSecret)}`);
         console.log('--------------------------------------------------');
     }
-    logger.important('[MAST] Remote update pushed! New file list:', logger.colors.yellow);
-    manifest.files.forEach((f, i) => {
-        console.log(`\x1b[33m[${i}]\x1b[0m ${truncatePath(f.path)} ${formatBytes(f.size)}`);
-    });
-    process.stdout.write('\nEnter indices (0,1,2), range (0-5), or "all": ');
+    logger.important('[MAST] Remote update pushed!\nPress any key to continue...', logger.colors.yellow);
+    if (manifest.reset_dir) {
+        logger.important('[MAST] Server changed directory. Reset to root.', logger.colors.cyan);
+    }
+    updateReceived = true;
 }
 
 function ask(question) {
@@ -263,25 +318,32 @@ async function worker(id, manifest, selectedFiles, pendingQueue, downloadDir, on
     return new Promise((resolve, reject) => {
         const socket = net.createConnection({ port: manifest.data_port, host: HOST });
         let buffer = Buffer.alloc(0);
-        function requestNext() {
-            const next = pendingQueue.shift();
-            if (next === undefined) {
+        let inFlight = 0;
+        const PIPELINE_DEPTH = 20;
+
+        function fillPipeline() {
+            while (inFlight < PIPELINE_DEPTH && pendingQueue.length > 0) {
+                const next = pendingQueue.shift();
+                if (!manifest.session_id) {
+                    reject(new Error("Missing Session ID"));
+                    return;
+                }
+                const req = Buffer.alloc(36);
+                req.write(manifest.session_id, 0, 32, 'hex');
+                req.writeUInt32BE(next, 32);
+                socket.write(req);
+                inFlight++;
+            }
+            if (inFlight === 0 && pendingQueue.length === 0) {
                 socket.end();
-                return;
             }
-            if (!manifest.session_id) {
-                reject(new Error("Missing Session ID"));
-                return;
-            }
-            const req = Buffer.alloc(36);
-            req.write(manifest.session_id, 0, 32, 'hex');
-            req.writeUInt32BE(next, 32);
-            socket.write(req);
         }
-        socket.on('connect', requestNext);
+
+        socket.on('connect', fillPipeline);
+
         socket.on('data', (chunk) => {
             buffer = Buffer.concat([buffer, chunk]);
-            if (buffer.length >= 8) {
+            while (buffer.length >= 8) {
                 const chunkId = buffer.readUInt32BE(0);
                 const chunkLen = buffer.readUInt32BE(4);
                 if (buffer.length >= 8 + chunkLen) {
@@ -308,11 +370,15 @@ async function worker(id, manifest, selectedFiles, pendingQueue, downloadDir, on
                     });
 
                     buffer = buffer.slice(8 + chunkLen);
+                    inFlight--;
                     onProgress();
-                    requestNext();
+                } else {
+                    break;
                 }
             }
+            fillPipeline();
         });
+
         socket.on('end', resolve);
         socket.on('error', (err) => {
             console.error(`[Worker ${id}] Connection error: ${err.message}`);
@@ -330,24 +396,117 @@ async function main() {
         }
 
         while (true) {
-            console.log('\n--- Remote File Manifest ---');
-            globalManifest.files.forEach((f, i) => {
-                console.log(`\x1b[33m[${i}]\x1b[0m ${truncatePath(f.path)} ${formatBytes(f.size)}`);
+
+            if (serverDisconnected) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                continue;
+            }
+
+            if (updateReceived) {
+                updateReceived = false;
+                await new Promise(resolve => setTimeout(resolve, 500));
+                continue;
+            }
+
+            if (!globalManifest || !globalManifest.files) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                continue;
+            }
+
+            console.log(`\n--- Remote File Manifest [/${globalCurrentDir}] ---`);
+
+            const viewItems = [];
+            const dirs = new Set();
+            const prefix = globalCurrentDir ? globalCurrentDir + '/' : '';
+
+            globalManifest.files.forEach((f, globalIndex) => {
+                if (f.path.startsWith(prefix)) {
+                    const remainder = f.path.slice(prefix.length);
+                    const slashIdx = remainder.indexOf('/');
+                    if (slashIdx === -1) {
+                        viewItems.push({ type: 'file', name: remainder, size: f.size, file: f });
+                    } else {
+                        const dirName = remainder.slice(0, slashIdx);
+                        if (!dirs.has(dirName)) {
+                            dirs.add(dirName);
+                            viewItems.push({ type: 'dir', name: dirName + '/', size: 0, globalIndices: [globalIndex] });
+                        } else {
+                            const dirItem = viewItems.find(i => i.type === 'dir' && i.name === dirName + '/');
+                            dirItem.globalIndices.push(globalIndex);
+                        }
+                    }
+                }
             });
 
-            const input = await ask('\nEnter indices (0,1,2), range (0-5), "all", or "q" to quit: ');
-            if (input.toLowerCase() === 'q') process.exit(0);
-            if (!input) continue;
+            viewItems.forEach((item, i) => {
+                if (item.type === 'dir') {
+                    console.log(`\x1b[36m[${i}]\x1b[0m \x1b[34m${item.name}\x1b[0m`);
+                } else {
+                    console.log(`\x1b[33m[${i}]\x1b[0m ${truncatePath(item.name)} ${formatBytes(item.size)}`);
+                }
+            });
+
+            const input = await ask('\nEnter indices (0,1,2), range (0-5), "all", "cd <dir>", "cd ..", or "q" to quit: ');
+            const cmd = input.trim();
+            if (cmd.toLowerCase() === 'q') process.exit(0);
+            if (!cmd) continue;
+
+            if (cmd.startsWith('cd ')) {
+                const target = cmd.slice(3).trim();
+                if (target === '..') {
+                    if (globalCurrentDir) {
+                        const parts = globalCurrentDir.split('/');
+                        parts.pop();
+                        globalCurrentDir = parts.join('/');
+                    }
+                } else if (target === '/') {
+                    globalCurrentDir = '';
+                } else {
+                    const dirItem = viewItems.find(i => i.type === 'dir' && i.name === target + '/');
+                    if (dirItem) {
+                        globalCurrentDir = globalCurrentDir ? globalCurrentDir + '/' + target : target;
+                    } else {
+                        console.log(`\n\x1b[31mDirectory not found: ${target}\x1b[0m`);
+                    }
+                }
+                process.stdout.write('\x1Bc');
+                printHeader();
+                if (currentServerId) {
+                    logger.important(`[MAST] Verified Sender ID: ${currentServerId.slice(0, 64)}...`, logger.colors.green);
+                    if (sharedSecret) logger.important(`[MAST] Session Fingerprint: ${getFingerprint(sharedSecret)}`);
+                    console.log('--------------------------------------------------');
+                }
+                continue;
+            }
 
             let selectedFiles = [];
-            if (input.toLowerCase() === 'all') {
-                selectedFiles = globalManifest.files;
-            } else if (input.includes('-')) {
-                const [startIdx, endIdx] = input.split('-').map(Number);
-                selectedFiles = globalManifest.files.slice(startIdx, endIdx + 1);
+            if (cmd.toLowerCase() === 'all') {
+                viewItems.forEach(item => {
+                    if (item.type === 'file') selectedFiles.push(item.file);
+                    else if (item.type === 'dir') {
+                        item.globalIndices.forEach(gi => selectedFiles.push(globalManifest.files[gi]));
+                    }
+                });
+            } else if (cmd.includes('-')) {
+                const [startIdx, endIdx] = cmd.split('-').map(Number);
+                for (let i = startIdx; i <= endIdx; i++) {
+                    const item = viewItems[i];
+                    if (item) {
+                        if (item.type === 'file') selectedFiles.push(item.file);
+                        else if (item.type === 'dir') item.globalIndices.forEach(gi => selectedFiles.push(globalManifest.files[gi]));
+                    }
+                }
             } else {
-                selectedFiles = input.split(',').map(Number).filter(i => !isNaN(i) && globalManifest.files[i]).map(i => globalManifest.files[i]);
+                const indices = cmd.split(',').map(Number).filter(i => !isNaN(i) && viewItems[i]);
+                indices.forEach(i => {
+                    const item = viewItems[i];
+                    if (item.type === 'file') selectedFiles.push(item.file);
+                    else if (item.type === 'dir') {
+                        item.globalIndices.forEach(gi => selectedFiles.push(globalManifest.files[gi]));
+                    }
+                });
             }
+
             if (selectedFiles.length === 0) continue;
 
             const start = Date.now();
@@ -361,13 +520,13 @@ async function main() {
             if (!fs.existsSync(downloadDir)) fs.mkdirSync(downloadDir);
 
             const identicalFiles = [];
-            const changedFiles   = [];
-            const skippedByUser  = new Set();
+            const changedFiles = [];
+            const skippedByUser = new Set();
 
             selectedFiles.forEach(f => {
                 const filePath = path.join(downloadDir, f.path);
                 if (fs.existsSync(filePath)) {
-                    const localHash  = computeFileHash(filePath);
+                    const localHash = computeFileHash(filePath);
                     const remoteHash = f.sha256 || null;
                     if (localHash && remoteHash && localHash === remoteHash) {
                         identicalFiles.push(f);
@@ -387,7 +546,7 @@ async function main() {
                 logger.important(`[MAST] ${changedFiles.length} file(s) differ from remote:`, logger.colors.yellow);
                 for (const { f, localHash, remoteHash } of changedFiles) {
                     console.log(`  \x1b[33m⚠\x1b[0m ${f.path} (${formatBytes(f.size)})`);
-                    console.log(`    \x1b[90mLocal  SHA-256: ${localHash  || 'unreadable'}\x1b[0m`);
+                    console.log(`    \x1b[90mLocal  SHA-256: ${localHash || 'unreadable'}\x1b[0m`);
                     console.log(`    \x1b[90mRemote SHA-256: ${remoteHash || 'unavailable'}\x1b[0m`);
                 }
                 const answer = await ask('\nOverwrite changed file(s)? (yes/no/select): ');
@@ -402,8 +561,8 @@ async function main() {
             }
 
             selectedFiles = selectedFiles.filter(f => {
-                if (identicalFiles.includes(f))  return false;
-                if (skippedByUser.has(f.path))   return false;
+                if (identicalFiles.includes(f)) return false;
+                if (skippedByUser.has(f.path)) return false;
                 return true;
             });
             if (selectedFiles.length === 0) {
@@ -414,10 +573,10 @@ async function main() {
             neededChunkIds.clear();
             selectedFiles.forEach(f => {
                 const startChunk = Math.floor(f.offset / globalManifest.chunk_size);
-                const endChunk   = Math.floor((f.offset + f.size - 1) / globalManifest.chunk_size);
+                const endChunk = Math.floor((f.offset + f.size - 1) / globalManifest.chunk_size);
                 for (let i = startChunk; i <= endChunk; i++) neededChunkIds.add(i);
             });
-            
+
             try {
                 selectedFiles.forEach(f => {
                     const filePath = path.join(downloadDir, f.path);
